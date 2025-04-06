@@ -1,8 +1,0 @@
-pandas
-numpy
-statsmodels
-pywt
-torch 
-scipy
-matplotlib
-hurst

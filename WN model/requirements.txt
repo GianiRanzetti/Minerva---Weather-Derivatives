@@ -1,0 +1,7 @@
+pandas
+numpy
+statsmodels
+pywt
+torch 
+scipy
+matplotlib

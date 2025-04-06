@@ -5,3 +5,4 @@ pywt
 torch 
 scipy
 matplotlib
+hurst

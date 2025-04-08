@@ -36,28 +36,20 @@ def wavelet_decompose(signal, wavelet_name='db11', max_level=None):
 
 def wavelet_reconstruct(coeff_dict, keep_levels, wavelet_name='db11'):
     """
-    Reconstructs a signal from selected wavelet levels.
-
-    Parameters:
-        coeff_dict (dict): Dictionary of wavelet coefficients.
-        keep_levels (list): Levels to keep (e.g., ['approx', 'detail_6', 'detail_7']).
-        wavelet_name (str): Wavelet used for reconstruction.
-
-    Returns:
-        array: Reconstructed signal with only selected components.
+    Reconstructs a signal from selected wavelet levels (standard-labeled).
     """
-    coeffs = []
-    max_level = len(coeff_dict) - 1
+    # Determine how many detail levels we have
+    num_details = len(coeff_dict) - 1  # excludes 'approx'
+
+    # Reconstruct the coeffs list in pywt format: [A_n, D_n, ..., D_1]
+    coeffs = [coeff_dict['approx']]
     
-    # Create list of all possible keys
-    all_keys = ['approx'] + [f'detail_{i}' for i in range(1, max_level + 1)]
-    
-    # Build coefficient list in the correct order
-    for key in all_keys:
-        if key in coeff_dict:
-            if key in keep_levels:
-                coeffs.append(coeff_dict[key])
-            else:
-                coeffs.append(np.zeros_like(coeff_dict[key]))
-    
+    # Reverse back to match pywt's expected [D_n, ..., D_1]
+    for i in range(num_details, 0, -1):
+        key = f'detail_{i}'
+        if key in keep_levels:
+            coeffs.append(coeff_dict[key])
+        else:
+            coeffs.append(np.zeros_like(coeff_dict[key]))
+
     return pywt.waverec(coeffs, wavelet_name)

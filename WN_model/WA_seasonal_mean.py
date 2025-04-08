@@ -2,11 +2,11 @@
 
 import pywt
 import numpy as np
-import pandas as pd
 
 def wavelet_decompose(signal, wavelet_name='db11', max_level=None):
     """
-    Decomposes a signal using Discrete Wavelet Transform (DWT).
+    Decomposes a signal using Discrete Wavelet Transform (DWT)
+    and returns a standard-order coefficient dictionary.
 
     Parameters:
         signal (array-like): The time series to decompose.
@@ -15,7 +15,7 @@ def wavelet_decompose(signal, wavelet_name='db11', max_level=None):
 
     Returns:
         dict: Dictionary with keys:
-              'approx' (level n) and 'detail_1', ..., 'detail_n'
+              'approx' (A_n) and 'detail_1' (D_1, highest freq), ..., 'detail_n' (D_n, lowest freq)
     """
     wavelet = pywt.Wavelet(wavelet_name)
     
@@ -24,8 +24,11 @@ def wavelet_decompose(signal, wavelet_name='db11', max_level=None):
     
     coeffs = pywt.wavedec(signal, wavelet=wavelet, level=max_level)
     
+    # Reverse the order of detail coefficients to match standard D_1 (highest freq), D_n (lowest)
+    detail_coeffs = coeffs[1:][::-1]
+    
     coeff_dict = {'approx': coeffs[0]}
-    for i, d in enumerate(coeffs[1:], start=1):
+    for i, d in enumerate(detail_coeffs, start=1):
         coeff_dict[f'detail_{i}'] = d
     
     return coeff_dict

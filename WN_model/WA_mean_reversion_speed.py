@@ -19,7 +19,7 @@ from functools import partial
 def get_device():
     """Get the best available device: MPS (Mac), CUDA, or CPU"""
     if torch.backends.mps.is_available():
-        return torch.device("cpu")
+        return torch.device("cpu")  
     elif torch.cuda.is_available():
         return torch.device("mps")
     else:
@@ -551,3 +551,41 @@ def estimate_mean_reversion(deseasonalized_temp, dates=None, max_lag=10, test_si
     }
     
     return results
+
+def get_full_k_series(data, max_lag=10, model_final=None, dates=None):
+    """
+    Compute k(t) values for the entire time series using the final model.
+    
+    Parameters:
+    -----------
+    df : pandas DataFrame
+        DataFrame containing the deseasonalized temperature data.
+    max_lag : int
+        Maximum lag used in the model.
+        
+    Returns:
+    --------
+    k_values : numpy array
+        Computed k(t) values for the entire time series.
+    """
+    # Step 1: Build the full dataset with lagged values.
+    X_full, y_full = build_lagged_dataset(data, max_lag=max_lag)
+
+    # Step 2: Convert the input features to a torch tensor and move them to the same DEVICE.
+    X_full_tensor = torch.FloatTensor(X_full).to(DEVICE)
+
+    # Step 3: Ensure correct model loading
+    if model_final is None:
+        raise ValueError("Final model must be provided to compute k(t) values.")
+    
+    else:
+        print(f"Model loaded correctly")
+
+    # Step 4: Use your final trained model to compute k values.
+    k_values = model_final.calculate_k(X_full_tensor) 
+    print("Computed k values:", k_values)
+
+    # Step 4: (Optional) If you want to align k-values with dates, remember that X_full starts at index max_lag.
+    aligned_dates = dates[max_lag:]
+
+    return k_values, aligned_dates

@@ -9,19 +9,21 @@ from torch.utils.data import DataLoader, TensorDataset
 from sklearn.model_selection import train_test_split
 from sklearn.metrics import mean_squared_error, r2_score
 from statsmodels.graphics.tsaplots import plot_acf
-from scipy.stats import norm
 import scipy.stats as stats
+from scipy.stats import t, norm
+import concurrent.futures
+from functools import partial
 
 
 # Add function to determine the best available device
 def get_device():
     """Get the best available device: MPS (Mac), CUDA, or CPU"""
     if torch.backends.mps.is_available():
-        return torch.device("mps")
-    elif torch.cuda.is_available():
-        return torch.device("cuda")
-    else:
         return torch.device("cpu")
+    elif torch.cuda.is_available():
+        return torch.device("mps")
+    else:
+        return torch.device("cuda")
 
 # Get the device once at module level
 DEVICE = get_device()
@@ -74,64 +76,23 @@ class WaveletNetwork(nn.Module):
         return x
     
     def calculate_k(self, x):
-        """Calculate the mean reversion parameter k(t)"""
+        # Clone x and enable gradients
         x_tensor = x.clone().requires_grad_(True)
+        # Compute the network output (assumed shape [batch, 1])
         y_pred = self.forward(x_tensor)
-        
-        # Calculate gradients with respect to the first lag (T_t)
-        grads = []
-        for i in range(len(x_tensor)):
-            # Zero all previous gradients
-            if x_tensor.grad is not None:
-                x_tensor.grad.zero_()
-            
-            # Backward for this sample
-            y_pred[i].backward(retain_graph=True)
-            
-            # Get gradient for T(t) (assuming it's the first feature)
-            grad_t = x_tensor.grad[i, 0].item()
-            grads.append(grad_t)
-        
-        # k(t) = ∂T(t+1)/∂T(t) - 1
-        k_values = np.array(grads) - 1
-        return k_values
-
-
-class MLP(nn.Module):
-    """Standard MLP model for comparison"""
-    def __init__(self, input_dim, hidden_dim, output_dim=1):
-        super(MLP, self).__init__()
-        self.fc1 = nn.Linear(input_dim, hidden_dim)
-        self.activation = nn.ReLU()
-        self.fc2 = nn.Linear(hidden_dim, output_dim)
-        
-    def forward(self, x):
-        x = self.activation(self.fc1(x))
-        x = self.fc2(x)
-        return x
-        
-    def calculate_k(self, x):
-        """Calculate the mean reversion parameter k(t)"""
-        x_tensor = x.clone().requires_grad_(True)
-        y_pred = self.forward(x_tensor)
-        
-        # Calculate gradients with respect to the first lag (T_t)
-        grads = []
-        for i in range(len(x_tensor)):
-            # Zero all previous gradients
-            if x_tensor.grad is not None:
-                x_tensor.grad.zero_()
-            
-            # Backward for this sample
-            y_pred[i].backward(retain_graph=True)
-            
-            # Get gradient for T(t) (assuming it's the first feature)
-            grad_t = x_tensor.grad[i, 0].item()
-            grads.append(grad_t)
-        
-        # k(t) = ∂T(t+1)/∂T(t) - 1
-        k_values = np.array(grads) - 1
-        return k_values
+        # Create a grad_outputs tensor of ones (same shape as y_pred)
+        grad_outputs = torch.ones_like(y_pred)
+        # Compute gradients of y_pred with respect to x_tensor (batch-wise)
+        grads = torch.autograd.grad(
+            outputs=y_pred, 
+            inputs=x_tensor, 
+            grad_outputs=grad_outputs, 
+            retain_graph=False, 
+            create_graph=False
+        )[0]
+        # Assume that T(t) is the first feature (index 0); then:
+        k_values = grads[:, 0] - 1
+        return k_values.cpu().numpy()
 
 
 def build_lagged_dataset(data, max_lag=10):
@@ -162,49 +123,6 @@ def build_lagged_dataset(data, max_lag=10):
         y[i - max_lag] = data[i]
     
     return X, y
-
-
-def sensitivity_based_pruning(model, X_tensor, threshold=0.01):
-    """
-    Perform sensitivity-based pruning to select significant lags
-    
-    Parameters:
-    -----------
-    model : torch.nn.Module
-        Trained model
-    X_tensor : torch.Tensor
-        Input tensor
-    threshold : float
-        Sensitivity threshold for keeping variables
-        
-    Returns:
-    --------
-    significant_lags : list
-        Indices of significant lags
-    """
-    X_test = X_tensor.clone().requires_grad_(True)
-    y_pred = model(X_test)
-    
-    # Calculate average sensitivity for each lag
-    sensitivities = []
-    for j in range(X_test.shape[1]):
-        X_test.grad = None  # Clear gradients
-        
-        # Get output with respect to specific lag
-        y_sum = y_pred.sum()
-        y_sum.backward(retain_graph=True)
-        
-        # Get average sensitivity for this lag
-        avg_sensitivity = torch.abs(X_test.grad[:, j]).mean().item()
-        sensitivities.append(avg_sensitivity)
-    
-    # Normalize sensitivities
-    normalized_sens = np.array(sensitivities) / np.max(sensitivities)
-    
-    # Select lags with sensitivity above threshold
-    significant_lags = [i for i, sens in enumerate(normalized_sens) if sens > threshold]
-    
-    return significant_lags, normalized_sens
 
 
 def train_model(model, X_train, y_train, X_val, y_val, epochs=1000, batch_size=32, lr=0.001):
@@ -300,93 +218,53 @@ def train_model(model, X_train, y_train, X_val, y_val, epochs=1000, batch_size=3
     print(f"Training completed in {total_time:.2f}s - Final Train Loss: {avg_train_loss:.6f}, Val Loss: {val_loss:.6f}")
     return history
 
-
 def evaluate_model(model, X_test, y_test, dates=None):
     """
-    Evaluate the model and visualize results
+    Evaluate the final model on the test set.
     
     Parameters:
     -----------
     model : torch.nn.Module
-        Trained model
-    X_test, y_test : numpy arrays
-        Test data
+        Trained model.
+    X_test : numpy array
+        Test inputs.
+    y_test : numpy array
+        True test targets.
     dates : array-like, optional
-        Dates corresponding to test data for plotting
-        
+        Dates corresponding to the test set (if available).
+    
     Returns:
     --------
     metrics : dict
-        Evaluation metrics
+        Dictionary of evaluation metrics (MSE, R², mean of k-values, std of k-values).
+    predictions : numpy array
+        Model predictions on X_test.
+    k_values : numpy array
+        Estimated k(t) values computed by model.calculate_k.
+    residuals : numpy array
+        Residuals (y_test - predictions).
     """
     model.eval()
+    # Convert test data to tensors.
     X_test_tensor = torch.FloatTensor(X_test).to(DEVICE)
+    y_test_tensor = torch.FloatTensor(y_test).view(-1, 1).to(DEVICE)
     
-    # Make predictions
     with torch.no_grad():
+        # Get predictions from the model.
         y_pred = model(X_test_tensor).cpu().numpy().flatten()
-    
-    # Calculate metrics
+        
+    # Compute evaluation metrics.
     mse = mean_squared_error(y_test, y_pred)
     r2 = r2_score(y_test, y_pred)
-    residuals = y_test - y_pred
     
-    # Calculate k(t) values
+    # Calculate k-values via the model's calculate_k method.
+    # Here, we assume that the first feature in X_test corresponds to T(t)
     k_values = model.calculate_k(X_test_tensor)
     
-    # Plot results
-    fig, axs = plt.subplots(3, 1, figsize=(14, 15))
+    # Compute residuals (difference between true and predicted values)
+    residuals = y_test - y_pred
     
-    # Plot 1: Predicted vs Actual
-    axs[0].plot(y_test, label='Actual', alpha=0.7)
-    axs[0].plot(y_pred, label='Predicted', alpha=0.7)
-    axs[0].set_title(f'Actual vs Predicted Temperature (MSE: {mse:.4f}, R²: {r2:.4f})')
-    axs[0].set_xlabel('Time Step')
-    axs[0].set_ylabel('Deseasonalized Temperature')
-    axs[0].legend()
-    axs[0].grid(True)
-    
-    # Plot 2: Mean Reversion Parameter k(t)
-    if dates is not None:
-        axs[1].plot(dates[-len(k_values):], k_values)
-    else:
-        axs[1].plot(k_values)
-    axs[1].set_title('Estimated Mean Reversion Parameter k(t)')
-    axs[1].set_xlabel('Time')
-    axs[1].set_ylabel('k(t)')
-    axs[1].grid(True)
-    
-    # Plot 3: Residual Analysis
-    plot_acf(residuals, lags=40, ax=axs[2])
-    axs[2].set_title('Autocorrelation of Residuals')
-    
-    plt.tight_layout()
-    plt.show()
-    
-    # QQ plot for residuals
-    plt.figure(figsize=(8, 6))
-    stats.probplot(residuals, dist="norm", plot=plt)
-    plt.title('Q-Q Plot of Residuals')
-    plt.grid(True)
-    plt.show()
-    
-    # Histogram of residuals
-    plt.figure(figsize=(8, 6))
-    plt.hist(residuals, bins=30, density=True, alpha=0.7)
-    
-    # Add a normal curve for comparison
-    xmin, xmax = plt.xlim()
-    x = np.linspace(xmin, xmax, 100)
-    p = norm.pdf(x, np.mean(residuals), np.std(residuals))
-    plt.plot(x, p, 'k', linewidth=2)
-    
-    plt.title('Distribution of Residuals')
-    plt.xlabel('Residual Value')
-    plt.ylabel('Density')
-    plt.grid(True)
-    plt.show()
-    
-    # Return metrics
+    # Prepare metrics dictionary.
     metrics = {
         'mse': mse,
         'r2': r2,
@@ -395,16 +273,6 @@ def evaluate_model(model, X_test, y_test, dates=None):
     }
     
     return metrics, y_pred, k_values, residuals
-
-
-import numpy as np
-import torch
-import torch.nn as nn
-import torch.optim as optim
-from sklearn.metrics import mean_squared_error
-from sklearn.model_selection import train_test_split
-from scipy.stats import t
-import copy
 
 # =============================================================================
 # Topology Selection using Minimum Prediction Risk (MPR)
@@ -426,9 +294,9 @@ def select_optimal_topology(X_train, y_train, X_val, y_val, input_dim, wavelet='
         if model_type.lower() == 'wavelet':
             model = WaveletNetwork(input_dim, hidden_units, output_dim=1, wavelet=wavelet)
         else:
-            model = MLP(input_dim, hidden_units, output_dim=1)
+            raise ValueError(f"Unsupported model type: {model_type}")
         
-        # Train the model (using your existing train_model function)
+        # Train the model
         _ = train_model(model, X_train, y_train, X_val, y_val, epochs=epochs, lr=lr, batch_size=batch_size)
         # Evaluate on validation set (use MSE as risk)
         model.eval()
@@ -488,28 +356,30 @@ def compute_SBP(model, X_data, y_data, variable_index):
 
     return loss_original - loss_modified
 
-def bootstrap_SBP(X, y, active_lags, model_constructor, B=200, epochs=500, lr=0.001, batch_size=32):
-    """
-    For each active lag (each column index in active_lags), perform B bootstrap replications
-    and compute the SBP measure. Returns a dictionary mapping lag index (from active_lags)
-    to a list of SBP values.
-    """
-    SBP_results = {j: [] for j in active_lags}
+def bootstrap_SBP_worker(b, X, y, active_lags, model_constructor, epochs, lr, batch_size):
     n = X.shape[0]
-    for b in range(B):
-        # Create bootstrap sample indices
-        bootstrap_indices = np.random.choice(n, size=n, replace=True)
-        X_boot = X[bootstrap_indices, :]
-        y_boot = y[bootstrap_indices]
-        # Build model on bootstrap sample (using the current set of active lags)
-        current_input_dim = len(active_lags)
-        model = model_constructor(current_input_dim).to(DEVICE)
-        # Train on the bootstrap sample
-        _ = train_model(model, X_boot, y_boot, X_boot, y_boot, epochs=epochs, lr=lr, batch_size=batch_size)
-        # For each lag, compute SBP
-        for j in active_lags:
-            sbp_value = compute_SBP(model, X_boot, y_boot, active_lags.index(j))
-            SBP_results[j].append(sbp_value)
+    bootstrap_indices = np.random.choice(n, size=n, replace=True)
+    X_boot = X[bootstrap_indices, :]
+    y_boot = y[bootstrap_indices]
+    current_input_dim = len(active_lags)
+    model = model_constructor(current_input_dim).to(DEVICE)
+    _ = train_model(model, X_boot, y_boot, X_boot, y_boot, epochs=epochs, lr=lr, batch_size=batch_size)
+    sbp_values = []
+    # Here, iterate over the columns of the bootstrapped dataset. They are 0-indexed.
+    for i in range(X_boot.shape[1]):
+        sbp_value = compute_SBP(model, X_boot, y_boot, i)
+        sbp_values.append(sbp_value)
+    # Optionally, we can map these back to the original lag indices
+    return {active_lags[i]: sbp_values[i] for i in range(len(active_lags))}
+
+def bootstrap_SBP(X, y, active_lags, model_constructor, B=200, epochs=500, lr=0.001, batch_size=32):
+    SBP_results = {j: [] for j in active_lags}
+    with concurrent.futures.ProcessPoolExecutor() as executor:
+        futures = [executor.submit(bootstrap_SBP_worker, b, X, y, active_lags, model_constructor, epochs, lr, batch_size) for b in range(B)]
+        for future in concurrent.futures.as_completed(futures):
+            result = future.result()
+            for j in active_lags:
+                SBP_results[j].append(result[j])
     return SBP_results
 
 def compute_p_value(sbp_values, B):
@@ -525,34 +395,32 @@ def compute_p_value(sbp_values, B):
     p_val = 2 * (1 - t.cdf(np.abs(t_stat), df=B-1))
     return p_val
 
+# Define a helper model constructor that returns an untrained model.
+def wavelet_model_constructor(input_dim, wavelet='mexh'):
+    """Return an untrained WaveletNetwork model with the specified input dimension and wavelet type."""
+    return WaveletNetwork(input_dim, hidden_dim=10, output_dim=1, wavelet=wavelet)
+
 def select_significant_lags(X, y, wavelet='mexh', model_type='wavelet',
                             initial_active_lags=None, B=200, epochs=500, lr=0.001,
                             batch_size=32, pval_threshold=0.1, risk_threshold=1.05):
     """
     Implements the variable selection algorithm from the book.
-    Iteratively, for the current set of active lags, compute the SBP measure (via bootstrapping)
-    and its p-value. Remove the lag with the largest p-value above the threshold if doing so does
-    not deteriorate the prediction risk (MSE) by more than risk_threshold times.
-    
-    Returns:
-      X_pruned: the dataset with only the selected lags
-      active_lags: a list of indices (columns) that remain.
     """
     if initial_active_lags is None:
         active_lags = list(range(X.shape[1]))
     else:
         active_lags = initial_active_lags[:]
     
-    # Define a helper model constructor that returns an untrained model.
-    def model_constructor(input_dim):
-        if model_type.lower() == 'wavelet':
-            return WaveletNetwork(input_dim, hidden_dim=10, output_dim=1, wavelet=wavelet)
-        else:
-            return MLP(input_dim, hidden_dim=10, output_dim=1)
+    # Use the global function with partial to fix the wavelet parameter.
+    if model_type.lower() == 'wavelet':
+        model_constructor = partial(wavelet_model_constructor, wavelet=wavelet)
+    else:
+        raise ValueError(f"Unsupported model type: {model_type}")
     
     # Get an initial risk on the full training dataset.
     X_current = X[:, active_lags]
     X_train, X_val, y_train, y_val = train_test_split(X_current, y, test_size=0.2, shuffle=False)
+
     model_full = model_constructor(len(active_lags)).to(DEVICE)
     _ = train_model(model_full, X_train, y_train, X_val, y_val, epochs=epochs, lr=lr, batch_size=batch_size)
     model_full.eval()
@@ -567,7 +435,7 @@ def select_significant_lags(X, y, wavelet='mexh', model_type='wavelet',
         improved = False
         # Compute bootstrap SBP for the current set of active lags.
         SBP_dict = bootstrap_SBP(X[:, active_lags], y, active_lags, model_constructor,
-                                 B=B, epochs=epochs, lr=lr, batch_size=batch_size)
+                                B=B, epochs=epochs, lr=lr, batch_size=batch_size)
         p_values = {}
         for j in active_lags:
             p_values[j] = compute_p_value(SBP_dict[j], B)
@@ -640,6 +508,10 @@ def estimate_mean_reversion(deseasonalized_temp, dates=None, max_lag=10, test_si
     X_train_val, X_test, y_train_val, y_test = train_test_split(X_pruned, y, test_size=test_size, shuffle=False)
     X_train, X_val, y_train, y_val = train_test_split(X_train_val, y_train_val, test_size=0.2, shuffle=False)
 
+    print(f"Training set shape: {X_train.shape}, Validation set shape: {X_val.shape}, Test set shape: {X_test.shape}")
+    print(f"Active lags after variable selection: {active_lags}")
+    print(f"Input shape after variable selection: {X_pruned.shape}")
+
     # Step 4: Topology selection using MPR on the training/validation split.
     input_dim = X_pruned.shape[1]
     optimal_hidden_units = select_optimal_topology(X_train, y_train, X_val, y_val, input_dim,
@@ -652,8 +524,7 @@ def estimate_mean_reversion(deseasonalized_temp, dates=None, max_lag=10, test_si
         model = WaveletNetwork(input_dim, optimal_hidden_units, output_dim=1, wavelet=wavelet)
         model_name = f"Wavelet Network ({wavelet}), hidden_dim={optimal_hidden_units}"
     else:
-        model = MLP(input_dim, optimal_hidden_units, output_dim=1)
-        model_name = f"MLP with hidden_dim={optimal_hidden_units}"
+        raise ValueError(f"Unsupported model type: {model_type}")
     
     print(f"Training final model: {model_name}")
     history = train_model(model, X_train, y_train, X_val, y_val, epochs=epochs, lr=lr, batch_size=batch_size)

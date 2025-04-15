@@ -19,9 +19,9 @@ from functools import partial
 def get_device():
     """Get the best available device: MPS (Mac), CUDA, or CPU"""
     if torch.backends.mps.is_available():
-        return torch.device("cpu")  
+        return torch.device("mps")  
     elif torch.cuda.is_available():
-        return torch.device("mps")
+        return torch.device("cpu")
     else:
         return torch.device("cuda")
 
@@ -125,25 +125,7 @@ def build_lagged_dataset(data, max_lag=10):
     return X, y
 
 
-def train_model(model, X_train, y_train, X_val, y_val, epochs=1000, batch_size=32, lr=0.001):
-    """
-    Train the given model on the dataset
-    
-    Parameters:
-    -----------
-    model : torch.nn.Module
-        Model to train
-    X_train, y_train : numpy arrays
-        Training data
-    X_val, y_val : numpy arrays
-        Validation data
-    epochs, batch_size, lr : training parameters
-        
-    Returns:
-    --------
-    history : dict
-        Training history
-    """
+def train_model(model, X_train, y_train, X_val, y_val, epochs=1000, batch_size=32, lr=0.001, early_stopping_patience=50):
     import time
     start_time = time.time()
     
@@ -195,12 +177,16 @@ def train_model(model, X_train, y_train, X_val, y_val, epochs=1000, batch_size=3
         history['train_loss'].append(avg_train_loss)
         history['val_loss'].append(val_loss)
         
-        # Check for improvement
+        # Early stopping check
         if val_loss < best_val_loss:
             best_val_loss = val_loss
             no_improve_count = 0
         else:
             no_improve_count += 1
+        
+        if no_improve_count >= early_stopping_patience:
+            print(f"Early stopping triggered at epoch {epoch+1}.")
+            break
         
         # Print progress
         if (epoch + 1) % print_freq == 0 or epoch == 0 or epoch == epochs - 1:

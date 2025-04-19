@@ -153,11 +153,10 @@ def estimate_speed_of_mean_reversion(
     k = coefs[:,0] - 1
     return k, coefs
 
-# Example orchestration function
 
 def fit_wavelet_model(
     series: pd.Series, max_lags: int,
-    candidate_hids: list, lr: float=1e-2, epochs: int=1000
+    candidate_hids: list, lr: float=1e-2, epochs: int=1000, return_model=False
 ):
     """
     Full pipeline: detrend & deseasonalize outside,
@@ -170,13 +169,20 @@ def fit_wavelet_model(
     # Build lag matrix X and target y
     X_list = []
     for i in range(max_lags):
-        X_list.append(torch.tensor(series.shift(i).iloc[max_lags:].values, dtype=torch.float32))
+        X_list.append(torch.tensor(series.shift(i+1).iloc[max_lags:].values, dtype=torch.float32))
     X = torch.stack(X_list, dim=1)
     y = torch.tensor(series.iloc[max_lags:].values, dtype=torch.float32)
     # 1. lag selection
     lags = select_lags_backward_elimination(X, y, max_lags, candidate_hids[0], lr, epochs)
     # 2. topology selection
     best_h = select_hidden_dim(X, y, lags, candidate_hids, lr, epochs)
+    # build & train the final model
+    wn = WaveletNetwork(input_dim=len(lags), hidden_dim=best_h)
+    X_final = X[:, lags]     # X is the lagged‐feature matrix you built earlier
+    wn.fit(X_final, y, lr=lr, epochs=epochs)
     # 3. k estimation
     k_series, coefs = estimate_speed_of_mean_reversion(X[:, lags], y, best_h, lr, epochs)
-    return lags, best_h, k_series, coefs
+    if return_model:
+        return lags, best_h, k_series, coefs, wn, max_lags
+    else:
+        return lags, best_h, k_series, coefs

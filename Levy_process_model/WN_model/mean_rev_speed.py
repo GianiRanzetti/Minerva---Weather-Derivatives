@@ -1,3 +1,8 @@
+#!/usr/bin/env python3
+"""
+Wavelet-based temperature mean reversion model for a weather station near Los Angeles.
+Verbose logging added to SBP, CV, and full pipeline.
+"""
 import numpy as np
 import pandas as pd
 import pywt
@@ -10,6 +15,9 @@ from scipy.optimize import curve_fit
 from sklearn.model_selection import KFold
 from sklearn.utils import resample
 
+# reproducibility
+torch.manual_seed(0)
+np.random.seed(0)
 
 class WaveletNetwork(nn.Module):
     def __init__(self, input_dim, hidden_dim):
@@ -33,13 +41,22 @@ class WaveletNetwork(nn.Module):
         self.train()
         optimizer = optim.Adam(self.parameters(), lr=lr)
         loss_fn = nn.MSELoss()
-        for epoch in range(epochs):
+        history = []                       # <— new
+
+        for epoch in range(1, epochs+1):
             optimizer.zero_grad()
-            loss = loss_fn(self(X), y)
+            y_pred = self(X)
+            loss = loss_fn(y_pred, y)
             loss.backward()
             optimizer.step()
-            if verbose and epoch % (epochs//5) == 0:
-                print(f"Epoch {epoch}, loss={loss.item():.4f}")
+
+            history.append(loss.item())    # <— record
+
+            if verbose and epoch % max(1, epochs//5) == 0:
+                print(f"  [WN] Epoch {epoch}/{epochs}, loss={loss.item():.6f}")
+
+        return history                     # <— return history
+
 
     def predict(self, X):
         self.eval()
@@ -49,31 +66,31 @@ class WaveletNetwork(nn.Module):
 # -----------------------------------------------
 # Sensitivity-Based Pruning (SBP) for lag selection
 # -----------------------------------------------
-def sbp_lag_selection(X, y, hidden_dim, alpha=0.1, B=50, lr=1e-2, epochs=500):
+def sbp_lag_selection(X, y, hidden_dim, alpha=0.5, B=20, lr=1e-2, epochs=300, verbose=False):
     current = list(range(X.shape[1]))
+    if verbose: print(f"[SBP] Starting with lags: {current}")
     improved = True
+    iter_count = 0
     while improved and len(current) > 1:
+        iter_count += 1
+        if verbose: print(f"[SBP] Iter {iter_count}, lags: {current}")
         X_sub = X[:, current]
-        # fit full model
         wn_full = WaveletNetwork(len(current), hidden_dim)
-        wn_full.fit(X_sub, y, lr=lr, epochs=epochs)
+        wn_full.fit(X_sub, y, lr=lr, epochs=epochs, verbose=verbose)
         L_full = nn.MSELoss()(wn_full.predict(X_sub), y).item()
         pvals = []
         for j in range(len(current)):
-            # observed SBP
             X_rep = X_sub.clone()
             X_rep[:, j] = X_rep[:, j].mean()
             wn_rep = WaveletNetwork(len(current), hidden_dim)
             wn_rep.fit(X_rep, y, lr=lr, epochs=epochs)
             L_rep = nn.MSELoss()(wn_rep.predict(X_rep), y).item()
             sbp_obs = L_rep - L_full
-            # bootstrap distribution under null
             sbp_bs = []
             n = X_sub.shape[0]
             for _ in range(B):
                 idx = resample(np.arange(n))
-                Xb = X_sub[idx]
-                yb = y[idx]
+                Xb = X_sub[idx]; yb = y[idx]
                 wn_b = WaveletNetwork(len(current), hidden_dim)
                 wn_b.fit(Xb, yb, lr=lr, epochs=epochs)
                 Lb_full = nn.MSELoss()(wn_b.predict(Xb), yb).item()
@@ -85,33 +102,40 @@ def sbp_lag_selection(X, y, hidden_dim, alpha=0.1, B=50, lr=1e-2, epochs=500):
                 sbp_bs.append(Lb_rep - Lb_full)
             pval = (np.sum(np.array(sbp_bs) >= sbp_obs) + 1) / (B + 1)
             pvals.append(pval)
+            if verbose: print(f"   [SBP] Lag {current[j]} p={pval:.3f}")
         max_p = max(pvals)
         if max_p > alpha:
             drop = pvals.index(max_p)
+            if verbose: print(f"[SBP] Dropping lag {current[drop]} (p={max_p:.3f} > {alpha})")
             current.pop(drop)
         else:
+            if verbose: print("[SBP] No lag to drop; finished.")
             improved = False
+    if verbose: print(f"[SBP] Final lags: {current}")
     return current
 
 # -----------------------------------------------
 # Hidden dimension selection via K-Fold CV
 # -----------------------------------------------
-def select_hidden_dim_cv(X, y, lags, candidate_hids, k=5, lr=1e-2, epochs=500):
+def select_hidden_dim_cv(X, y, lags, candidate_hids, k=5, lr=1e-2, epochs=300, verbose=False):
     best_h, best_mse = None, np.inf
-    X_sub = X[:, lags]
-    n = X_sub.shape[0]
+    X_sub = X[:, lags]; n = X_sub.shape[0]
     for h in candidate_hids:
+        if verbose: print(f"[CV] Testing h={h}")
         mses = []
         kf = KFold(n_splits=k, shuffle=True, random_state=0)
-        for train_idx, val_idx in kf.split(np.arange(n)):
-            Xt, yt = X_sub[train_idx], y[train_idx]
-            Xv, yv = X_sub[val_idx], y[val_idx]
+        for fold, (ti, vi) in enumerate(kf.split(np.arange(n)),1):
+            Xt, yt = X_sub[ti], y[ti]
+            Xv, yv = X_sub[vi], y[vi]
             wn = WaveletNetwork(len(lags), h)
             wn.fit(Xt, yt, lr=lr, epochs=epochs)
-            mses.append(nn.MSELoss()(wn.predict(Xv), yv).item())
-        avg_mse = np.mean(mses)
-        if avg_mse < best_mse:
-            best_mse, best_h = avg_mse, h
+            mse = nn.MSELoss()(wn.predict(Xv), yv).item()
+            mses.append(mse)
+            if verbose: print(f"  [CV] fold {fold}, mse={mse:.6f}")
+        avg = np.mean(mses)
+        if verbose: print(f"[CV] h={h}, avg mse={avg:.6f}")
+        if avg < best_mse: best_mse, best_h = avg, h
+    if verbose: print(f"[CV] Selected h={best_h} (mse={best_mse:.6f})")
     return best_h
 
 # -----------------------------------------------
@@ -127,11 +151,11 @@ def estimate_speed_of_mean_reversion(X, y, hidden_dim, lr=1e-2, epochs=1000):
     return k, grads
 
 # -----------------------------------------------
-# Full WN pipeline
+# Full WN pipeline with verbosity
 # -----------------------------------------------
 def fit_wavelet_model(series, max_lags, candidate_hids, sbp_hid,
-                      lr=1e-2, epochs=1000):
-    # prepare lag matrix
+                      lr=1e-2, epochs=1000, verbose=True):
+    if verbose: print("=== Wavelet Mean-Reversion Pipeline ===")
     vals = series.values
     X = torch.stack([
         torch.tensor(series.shift(i+1).fillna(method='bfill').values,
@@ -139,13 +163,14 @@ def fit_wavelet_model(series, max_lags, candidate_hids, sbp_hid,
         for i in range(max_lags)
     ], dim=1)
     y = torch.tensor(vals, dtype=torch.float32)
-    # lag selection
-    lags = sbp_lag_selection(X, y, sbp_hid, lr=lr, epochs=epochs)
-    # topology selection
-    best_h = select_hidden_dim_cv(X, y, lags, candidate_hids, lr=lr, epochs=epochs)
-    # final fit
+    if verbose: print("--> SBP lag selection")
+    lags = sbp_lag_selection(X, y, sbp_hid, lr=lr, epochs=epochs, verbose=verbose)
+    if verbose: print("--> Hidden-dim selection via CV")
+    best_h = select_hidden_dim_cv(X, y, lags, candidate_hids, lr=lr, epochs=epochs, verbose=verbose)
+    if verbose: print(f"--> Final model: lags={lags}, h={best_h}")
     Xf = X[:, lags]
     wn = WaveletNetwork(len(lags), best_h)
-    wn.fit(Xf, y, lr=lr, epochs=epochs)
+    history = wn.fit(Xf, y, lr=lr, epochs=epochs, verbose=verbose)
     k_ser, coefs = estimate_speed_of_mean_reversion(Xf, y, best_h, lr=lr, epochs=epochs)
-    return lags, best_h, k_ser, coefs, wn
+    if verbose: print("=== Pipeline complete ===")
+    return lags, best_h, k_ser, coefs, wn, history

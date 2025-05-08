@@ -9,6 +9,11 @@ import pywt
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+# Select device for computation (force CPU)
+device = torch.device("cpu")
+print("DEBUG: Forcing CPU for computation.")
+
 from scipy.stats import kurtosis, linregress
 from statsmodels.tsa.stattools import adfuller, kpss
 from scipy.optimize import curve_fit
@@ -38,10 +43,14 @@ class WaveletNetwork(nn.Module):
         return direct + wave + self.bias
 
     def fit(self, X, y, lr=1e-2, epochs=1000, verbose=False):
+        # Move model and data to device
+        self.to(device)
+        X = X.to(device)
+        y = y.to(device)
+
         self.train()
         optimizer = optim.Adam(self.parameters(), lr=lr)
         loss_fn = nn.MSELoss()
-        history = []                       # <— new
 
         for epoch in range(1, epochs+1):
             optimizer.zero_grad()
@@ -50,15 +59,16 @@ class WaveletNetwork(nn.Module):
             loss.backward()
             optimizer.step()
 
-            history.append(loss.item())    # <— record
-
             if verbose and epoch % max(1, epochs//5) == 0:
                 print(f"  [WN] Epoch {epoch}/{epochs}, loss={loss.item():.6f}")
 
-        return history                     # <— return history
+        return                  
 
 
     def predict(self, X):
+        # Move input to the same device as the model
+        X = X.to(device)
+
         self.eval()
         with torch.no_grad():
             return self(X)
@@ -66,7 +76,7 @@ class WaveletNetwork(nn.Module):
 # -----------------------------------------------
 # Sensitivity-Based Pruning (SBP) for lag selection
 # -----------------------------------------------
-def sbp_lag_selection(X, y, hidden_dim, alpha=0.5, B=20, lr=1e-2, epochs=300, verbose=False):
+def sbp_lag_selection(X, y, hidden_dim, alpha=0.1, B=20, lr=1e-2, epochs=300, verbose=False):
     current = list(range(X.shape[1]))
     if verbose: print(f"[SBP] Starting with lags: {current}")
     improved = True
@@ -163,6 +173,11 @@ def fit_wavelet_model(series, max_lags, candidate_hids, sbp_hid,
         for i in range(max_lags)
     ], dim=1)
     y = torch.tensor(vals, dtype=torch.float32)
+
+    # Move data to device
+    X = X.to(device)
+    y = y.to(device)
+
     if verbose: print("--> SBP lag selection")
     lags = sbp_lag_selection(X, y, sbp_hid, lr=lr, epochs=epochs, verbose=verbose)
     if verbose: print("--> Hidden-dim selection via CV")
@@ -170,7 +185,7 @@ def fit_wavelet_model(series, max_lags, candidate_hids, sbp_hid,
     if verbose: print(f"--> Final model: lags={lags}, h={best_h}")
     Xf = X[:, lags]
     wn = WaveletNetwork(len(lags), best_h)
-    history = wn.fit(Xf, y, lr=lr, epochs=epochs, verbose=verbose)
+    wn.fit(Xf, y, lr=lr, epochs=epochs, verbose=verbose)
     k_ser, coefs = estimate_speed_of_mean_reversion(Xf, y, best_h, lr=lr, epochs=epochs)
     if verbose: print("=== Pipeline complete ===")
-    return lags, best_h, k_ser, coefs, wn, history
+    return lags, best_h, k_ser, coefs, wn

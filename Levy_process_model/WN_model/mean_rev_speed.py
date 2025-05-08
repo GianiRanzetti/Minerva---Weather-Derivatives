@@ -72,6 +72,19 @@ class WaveletNetwork(nn.Module):
         self.eval()
         with torch.no_grad():
             return self(X)
+    
+    def partial_coefs(self, X: torch.Tensor) -> torch.Tensor:
+        """
+        Compute ∂ŷ/∂x_j for each sample and input dimension.
+        Returns a tensor of shape (n_samples, input_dim).
+        """
+        self.eval()
+        # Move X to the same device as the model and enable grads:
+        X_req = X.clone().detach().to(device).requires_grad_(True)
+        y_pred = self(X_req)
+        # Sum outputs so we can backpropagate a scalar
+        grads = torch.autograd.grad(y_pred.sum(), X_req)[0]
+        return grads
 
 # -----------------------------------------------
 # Sensitivity-Based Pruning (SBP) for lag selection
@@ -189,3 +202,5 @@ def fit_wavelet_model(series, max_lags, candidate_hids, sbp_hid,
     k_ser, coefs = estimate_speed_of_mean_reversion(Xf, y, best_h, lr=lr, epochs=epochs)
     if verbose: print("=== Pipeline complete ===")
     return lags, best_h, k_ser, coefs, wn
+
+

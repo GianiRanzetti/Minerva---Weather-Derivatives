@@ -1,1 +1,3 @@
-.DS_Store
+SARIMA/sarima_model.pkl
+SARIMA/sarima_model_results.pkl
+SARIMA/best_model.pkl
